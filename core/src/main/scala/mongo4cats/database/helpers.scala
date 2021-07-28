@@ -16,15 +16,17 @@
 
 package mongo4cats.database
 
+import cats.implicits._
 import cats.effect.Async
 import cats.effect.std.{Dispatcher, Queue}
 import fs2.Stream
 import org.reactivestreams.{Publisher, Subscriber, Subscription}
 
 import scala.util.Either
+import cats.effect.kernel._
+import scala.concurrent.duration._
 
 private[database] object helpers {
-
   implicit final class PublisherOps[T](private val publisher: Publisher[T]) extends AnyVal {
     def asyncSingle[F[_]: Async]: F[T] =
       Async[F].async_ { k =>
@@ -62,16 +64,33 @@ private[database] object helpers {
       for {
         dispatcher <- Stream.resource(Dispatcher[F])
         queue      <- Stream.eval(Queue.bounded[F, Option[Either[Throwable, T]]](queueCapacity))
-        _ <- Stream.eval(Async[F].delay(publisher.subscribe(new Subscriber[T] {
-          override def onNext(result: T): Unit =
-            dispatcher.unsafeRunSync(queue.offer(Some(Right(result))))
-          override def onError(e: Throwable): Unit =
-            dispatcher.unsafeRunSync(queue.offer(Some(Left(e))))
-          override def onComplete(): Unit =
-            dispatcher.unsafeRunSync(queue.offer(None))
-          override def onSubscribe(s: Subscription): Unit = s.request(Long.MaxValue)
-        })))
-        stream <- Stream.fromQueueNoneTerminated(queue).evalMap(Async[F].fromEither)
+        // sub        <- Stream.eval(Ref[F].of[Option[Subscription]](None))
+        sub <- Stream.eval(Queue.bounded[F, Subscription](1))
+        subscriber <- Stream.eval(
+          Sync[F].delay(new Subscriber[T] {
+            override def onNext(result: T): Unit =
+              dispatcher.unsafeRunSync(queue.offer(Some(Right(result))))
+            override def onError(e: Throwable): Unit =
+              dispatcher.unsafeRunSync(queue.offer(Some(Left(e))))
+            override def onComplete(): Unit =
+              dispatcher.unsafeRunSync(queue.offer(None))
+            override def onSubscribe(s: Subscription): Unit = {
+              dispatcher.unsafeRunSync(sub.offer(s))
+              s.request(Long.MaxValue)
+            }
+          })
+        )
+        _ <- Stream.eval(Sync[F].delay(publisher.subscribe(subscriber)))
+        stream <- Stream
+          .fromQueueNoneTerminated(queue)
+          .evalMap(Async[F].fromEither)
+          .onFinalize(
+            Async[F].timeoutTo(
+              sub.take.flatMap(sub => Sync[F].delay(sub.cancel)),
+              10.seconds,
+              Sync[F].raiseError[Unit](new Throwable("Failed to close reactivestreams subscriber"))
+            )
+          )
       } yield stream
   }
 }
